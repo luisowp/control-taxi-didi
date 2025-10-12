@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Control de Ganancia Neta de Taxi</title>
+    <!-- Carga de Tailwind CSS para el estilo -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Configuración para usar la fuente Inter -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7fafc;
+        }
+        /* Estilo para el botón de eliminación personalizado */
+        .delete-btn:hover {
+            color: #ef4444; /* rojo-500 */
+        }
+        /* Clase para ocultar secciones por defecto */
+        .config-hidden {
+            display: none;
+        }
+    </style>
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, onSnapshot, query, addDoc, updateDoc, deleteDoc, doc, setDoc, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Establecer el nivel de depuración para ver logs en la consola
+        setLogLevel('debug');
+
+        // ******************************************************************************
+        // PASO CLAVE: REEMPLAZAR ESTA CONFIGURACIÓN CON LA TUYA DE LA CONSOLA DE FIREBASE
+        // ******************************************************************************
+        const firebaseConfig = {
+        apiKey: "AIzaSyDuj3vuQgmGw4WO6WD_rLsairxwbZan8p4",
+        authDomain: "control-taxi-didi-app.firebaseapp.com",
+        projectId: "control-taxi-didi-app",
+        storageBucket: "control-taxi-didi-app.firebasestorage.app",
+        messagingSenderId: "203784439715",
+        appId: "1:203784439715:web:945014214044a9f6ecbc16"
+        };
+
+        
+        // Define un ID de aplicación fijo para la ruta de Firestore
+        const appId = "taxi-control-app"; 
+        
+        // --- Configuración de la API de Gemini ---
+        const API_KEY = ""; // La clave se proporciona automáticamente por el entorno.
+        const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent";
+
+        let app, db, auth, userId = null;
+        let dataCollectionRef;
+        let configDocRef; 
+        let allRegistros = []; 
+
+        /**
+         * Realiza una solicitud fetch con retroceso exponencial para manejar errores y reintentos.
+         * @param {string} url - URL de la API.
+         * @param {object} options - Opciones de fetch.
+         * @param {number} maxRetries - Máximo de reintentos.
+         * @returns {Promise<Response>} Respuesta de la API.
+         */
+        async function fetchWithExponentialBackoff(url, options, maxRetries = 5) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.ok) {
+                        return response;
+                    }
+                    if (response.status === 429 && i < maxRetries - 1) { // 429 Too Many Requests
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                    throw new Error(`Error en la solicitud HTTP: ${response.status} ${response.statusText}`);
+                } catch (error) {
+                    if (i === maxRetries - 1) {
+                        throw error;
+                    }
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+
+
+        /**
+         * Función para inicializar Firebase y autenticar al usuario.
+         */
+        async function initializeFirebase() {
+            try {
+                // La configuración ya está en el archivo, así que procedemos directamente.
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // Forzamos la autenticación anónima. ESTO REQUIERE HABILITAR 
+                // EL PROVEEDOR "ANÓNIMO" EN LA CONSOLA DE FIREBASE > AUTHENTICATION.
+                await signInAnonymously(auth);
+
+                // Esperar el cambio de estado de autenticación para obtener el userId
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        // Mostrar el ID de usuario en la UI para fines de colaboración/soporte
+                        document.getElementById('user-id-display').textContent = `Tu ID de Sesión: ${userId}`;
+                        
+                        // Rutas para datos privados (Ahora usando el UID del usuario anónimo)
+                        const userPath = `artifacts/${appId}/users/${userId}`;
+                        
+                        // Referencia a la colección de registros
+                        dataCollectionRef = collection(db, `${userPath}/registros_taxi`);
+                        
+                        // Referencia al documento único de configuración
+                        configDocRef = doc(db, `${userPath}/configuracion_app/general`);
+                        
+                        loadConfig(); // Cargar la configuración al iniciar
+                        listenToData(); // Empezar a escuchar datos una vez autenticado
+                        
+                        // Establecer la fecha actual en el filtro de periodo
+                        document.getElementById('periodo-date').valueAsDate = new Date();
+
+                    } else {
+                        userId = null;
+                        document.getElementById('user-id-display').textContent = 'Error de autenticación: No hay usuario.';
+                        console.error("No se pudo obtener el usuario autenticado.");
+                    }
+                });
+
+            } catch (error) {
+                document.getElementById('user-id-display').textContent = `Error al iniciar: ${error.message}`;
+                console.error("Error al inicializar o autenticar Firebase:", error);
+            }
+        }
+        
+        // Objeto global para almacenar la configuración leída
+        window.currentConfig = {
+            costoGasolina: 0,
+            rendimientoGasolina: 1, // km/litro. Evitar división por cero si es 0.
+            rentaSemanal: 0, // Nuevo campo para la renta semanal
+            nombreChofer: 'N/A',
+            placas: 'N/A',
+            plataforma: 'DiDi'
+        };
+
+
+        /**
+         * Carga la configuración fija de la base de datos y actualiza el formulario.
+         */
+        async function loadConfig() {
+            if (!configDocRef) return;
+            try {
+                const docSnap = await getDoc(configDocRef);
+                const configForm = document.getElementById('config-form');
+
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    window.currentConfig.costoGasolina = Number(data.costoGasolina) || 0;
+                    window.currentConfig.rendimientoGasolina = Number(data.rendimientoGasolina) || 1;
+                    window.currentConfig.rentaSemanal = Number(data.rentaSemanal) || 0; // Cargar renta semanal
+                    window.currentConfig.nombreChofer = data.nombreChofer || 'N/A';
+                    window.currentConfig.placas = data.placas || 'N/A';
+                    window.currentConfig.plataforma = data.plataforma || 'DiDi';
+
+                    // Rellenar el formulario
+                    configForm.nombreChofer.value = data.nombreChofer || '';
+                    configForm.placas.value = data.placas || '';
+                    configForm.plataforma.value = data.plataforma || 'DiDi';
+                    configForm.costoGasolina.value = data.costoGasolina || '';
+                    configForm.rendimientoGasolina.value = data.rendimientoGasolina || '';
+                    configForm.rentaSemanal.value = data.rentaSemanal || ''; // Rellenar renta semanal
+
+                    showMessage('Configuración cargada con éxito.', 'bg-indigo-500');
+                } else {
+                    showMessage('Configuración no encontrada. Por favor, ingrésala.', 'bg-yellow-500');
+                }
+                // Disparar una actualización de totales por si los registros ya estaban cargados
+                listenToData(); 
+            } catch (error) {
+                console.error("Error al cargar la configuración:", error);
+                showMessage('Error al cargar la configuración.', 'bg-red-500');
+            }
+        }
+        
+        /**
+         * Guarda la configuración fija en la base de datos.
+         */
+        window.saveConfig = async () => {
+            const form = document.getElementById('config-form');
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+            if (!configDocRef) {
+                showMessage('Base de datos no inicializada. Intenta de nuevo.', 'bg-red-500');
+                return;
+            }
+            
+            const data = {
+                nombreChofer: form.nombreChofer.value,
+                placas: form.placas.value,
+                plataforma: form.plataforma.value,
+                costoGasolina: parseFloat(form.costoGasolina.value),
+                rendimientoGasolina: parseFloat(form.rendimientoGasolina.value),
+                rentaSemanal: parseFloat(form.rentaSemanal.value), // Guardar renta semanal
+            };
+
+            try {
+                // setDoc crea el documento si no existe, o lo sobrescribe si existe.
+                await setDoc(configDocRef, data);
+                
+                // Actualizar la configuración global y recargar datos
+                window.currentConfig.costoGasolina = data.costoGasolina;
+                window.currentConfig.rendimientoGasolina = data.rendimientoGasolina;
+                window.currentConfig.rentaSemanal = data.rentaSemanal; // Actualizar renta semanal
+                window.currentConfig.nombreChofer = data.nombreChofer;
+                window.currentConfig.placas = data.placas;
+                window.currentConfig.plataforma = data.plataforma;
+                
+                toggleSection('main-dashboard', 'config-section'); // Corregido: Volver al dashboard
+                listenToData(); // Recalcular totales y actualizar tabla si es necesario
+                showMessage('Configuración guardada con éxito.', 'bg-green-600');
+            } catch (error) {
+                console.error("Error al guardar la configuración:", error);
+                showMessage('Error al guardar la configuración.', 'bg-red-500');
+            }
+        }
+
+
+        /**
+         * Escucha los cambios en la colección de registros en tiempo real.
+         */
+        function listenToData() {
+            if (!dataCollectionRef) return;
+
+            const q = query(dataCollectionRef);
+            const rentaDiaria = window.currentConfig.rentaSemanal / 7;
+
+            onSnapshot(q, (snapshot) => {
+                allRegistros = [];
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    const gastoRentaDiaria = rentaDiaria; // Aplicar la renta diaria
+                    
+                    allRegistros.push({
+                        id: doc.id,
+                        fecha: data.fecha, // formato 'YYYY-MM-DD'
+                        kmRecorridos: Number(data.kmRecorridos),
+                        ingresoDiDi: Number(data.ingresoDiDi),
+                        gastoCombustible: Number(data.gastoCombustible),
+                        otrosGastos: Number(data.otrosGastos),
+                        gastoRentaDiaria: gastoRentaDiaria, // Añadir el gasto de renta diario
+                        descripcionGastos: data.descripcionGastos || '',
+                        // Nueva Ganancia Neta: Ingresos - (Combustible + Otros + Renta Diaria)
+                        gananciaNeta: Number(data.ingresoDiDi) - Number(data.gastoCombustible) - Number(data.otrosGastos) - gastoRentaDiaria
+                    });
+                });
+                // Ordenar por fecha (más reciente primero)
+                allRegistros.sort((a, b) => b.fecha.localeCompare(a.fecha));
+                
+                // Aplicar el filtro de periodo actual
+                filterAndRenderData(); 
+
+            }, (error) => {
+                console.error("Error al escuchar los datos:", error);
+                document.getElementById('registros-container').innerHTML = `<p class="text-red-500">Error al cargar datos: ${error.message}</p>`;
+            });
+        }
+        
+        /**
+         * Obtiene las fechas de inicio y fin para el periodo seleccionado.
+         * @param {string} periodType - 'day', 'week', 'month', or 'all'.
+         * @param {string} dateString - Fecha base en formato 'YYYY-MM-DD'.
+         * @returns {{startDate: string, endDate: string}} Fechas de inicio y fin en 'YYYY-MM-DD'.
+         */
+        function getStartAndEndDates(periodType, dateString) {
+            if (periodType === 'all') {
+                // Devolver rango amplio para incluir todos los datos
+                return { startDate: '1900-01-01', endDate: '2999-12-31' };
+            }
+
+            const baseDate = new Date(dateString + 'T00:00:00');
+            let startDate = new Date(baseDate);
+            let endDate = new Date(baseDate);
+
+            // Función auxiliar para convertir Date a 'YYYY-MM-DD'
+            const toYYYYMMDD = (date) => date.toISOString().split('T')[0];
+
+            if (periodType === 'day') {
+                // Para el día, el inicio y el fin son la misma fecha
+            } else if (periodType === 'week') {
+                // Calcular el inicio de la semana (domingo = 0, lunes = 1, etc.)
+                // Ajustar al lunes como inicio de semana (ISO 8601: Lunes = 1)
+                const day = baseDate.getDay(); // 0=Domingo, 1=Lunes, ..., 6=Sábado
+                const diff = baseDate.getDate() - day + (day === 0 ? -6 : 1); // Ajustar para que la semana empiece en Lunes
+                startDate.setDate(diff);
+
+                // Calcular el fin de la semana (domingo)
+                endDate = new Date(startDate);
+                endDate.setDate(startDate.getDate() + 6);
+
+            } else if (periodType === 'month') {
+                // Inicio del mes
+                startDate.setDate(1);
+
+                // Fin del mes
+                endDate.setMonth(baseDate.getMonth() + 1);
+                endDate.setDate(0);
+            }
+
+            return { 
+                startDate: toYYYYMMDD(startDate), 
+                endDate: toYYYYMMDD(endDate) 
+            };
+        }
+
+        /**
+         * Filtra los registros según el periodo y la fecha seleccionados y renderiza el resultado.
+         */
+        window.filterAndRenderData = () => {
+            const periodType = document.getElementById('periodo-select').value;
+            const dateString = document.getElementById('periodo-date').value;
+            const dates = getStartAndEndDates(periodType, dateString);
+
+            let filteredRegistros = allRegistros;
+
+            if (periodType !== 'all') {
+                filteredRegistros = allRegistros.filter(registro => 
+                    registro.fecha >= dates.startDate && registro.fecha <= dates.endDate
+                );
+            }
+            
+            // Actualizar la etiqueta del periodo
+            let periodLabel = 'Todos los Registros';
+            if (periodType === 'day') {
+                periodLabel = `Día: ${dates.startDate}`;
+            } else if (periodType === 'week') {
+                periodLabel = `Semana: ${dates.startDate} al ${dates.endDate}`;
+            } else if (periodType === 'month') {
+                const [year, month] = dates.startDate.split('-');
+                periodLabel = `Mes: ${month}/${year}`;
+            }
+            document.getElementById('current-period-label').textContent = periodLabel;
+
+            renderRegistros(filteredRegistros);
+            calculateTotals(filteredRegistros);
+        }
+
+        /**
+         * Renderiza la tabla de registros.
+         * @param {Array<Object>} registros - Lista de registros a mostrar.
+         */
+        function renderRegistros(registros) {
+            const container = document.getElementById('registros-container');
+            if (registros.length === 0) {
+                container.innerHTML = '<p class="text-gray-500 text-center py-4">No se encontraron registros para el periodo seleccionado.</p>';
+                return;
+            }
+
+            // Construir la tabla
+            const tableHTML = `
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Fecha</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">KM</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Ingreso DiDi</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Combustible</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Renta Diaria</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Otros Gastos</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Ganancia Neta</th>
+                                <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Acciones</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            ${registros.map(reg => `
+                                <tr class="hover:bg-gray-50">
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm text-gray-900">${reg.fecha}</td>
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm text-gray-700">${reg.kmRecorridos.toFixed(0)} km</td>
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm text-green-600 font-semibold">$${reg.ingresoDiDi.toFixed(2)}</td>
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm text-red-600">$${reg.gastoCombustible.toFixed(2)}</td>
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm text-red-600">$${reg.gastoRentaDiaria.toFixed(2)}</td>
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm text-red-600" title="${reg.descripcionGastos}">$${reg.otrosGastos.toFixed(2)}</td>
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm ${reg.gananciaNeta >= 0 ? 'text-blue-600' : 'text-red-700'} font-bold">$${reg.gananciaNeta.toFixed(2)}</td>
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm font-medium">
+                                        <button onclick="editRegistro('${reg.id}')" class="text-indigo-600 hover:text-indigo-900 focus:outline-none transition duration-150 ease-in-out mr-2">
+                                            <!-- Icono de Editar (Lápiz) -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                                            </svg>
+                                        </button>
+                                        <button onclick="confirmDelete('${reg.id}')" class="delete-btn text-gray-400 focus:outline-none transition duration-150 ease-in-out">
+                                            <!-- Icono de Eliminar (Bote de basura) -->
+                                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                            </svg>
+                                        </button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            container.innerHTML = tableHTML;
+        }
+
+        /**
+         * Calcula y muestra los totales acumulados.
+         * @param {Array<Object>} registros - Lista de registros.
+         */
+        function calculateTotals(registros) {
+            const totalKM = registros.reduce((sum, reg) => sum + reg.kmRecorridos, 0);
+            const totalIngresos = registros.reduce((sum, reg) => sum + reg.ingresoDiDi, 0);
+            const totalCombustible = registros.reduce((sum, reg) => sum + reg.gastoCombustible, 0);
+            const totalOtrosGastos = registros.reduce((sum, reg) => sum + reg.otrosGastos, 0);
+            // Calcular el total de renta diaria para el periodo filtrado
+            const totalRentaDiaria = registros.reduce((sum, reg) => sum + reg.gastoRentaDiaria, 0);
+
+            const totalGastosGenerales = totalCombustible + totalOtrosGastos + totalRentaDiaria;
+            const totalNeta = totalIngresos - totalGastosGenerales;
+            
+            // Calcular Ganancia Neta por KM (si los datos de configuración están disponibles)
+            let gananciaNetaPorKM = 0;
+            if (totalKM > 0) {
+                gananciaNetaPorKM = totalNeta / totalKM;
+            }
+
+            // Calcular Costo por KM basado en la configuración
+            let costoPorKM = 0;
+            const rend = window.currentConfig.rendimientoGasolina;
+            const costoLitro = window.currentConfig.costoGasolina;
+            const rentaDiaria = window.currentConfig.rentaSemanal / 7; // Renta diaria para métrica
+            
+            // Gasto de renta diaria para mostrar en el dashboard
+            document.getElementById('gasto-renta-diaria').textContent = `$${rentaDiaria.toFixed(2)}`;
+
+            if (rend > 0 && costoLitro > 0) {
+                costoPorKM = costoLitro / rend; // Costo por Litro / KM por Litro = Costo por KM
+            }
+            
+            // Actualizar la UI
+            document.getElementById('info-chofer').textContent = `${window.currentConfig.nombreChofer} | ${window.currentConfig.placas}`;
+            document.getElementById('total-km').textContent = totalKM.toFixed(0) + ' km';
+            document.getElementById('total-ingresos').textContent = '$' + totalIngresos.toFixed(2);
+            document.getElementById('total-gastos').textContent = '$' + totalGastosGenerales.toFixed(2); // Incluye renta
+            
+            const netaElement = document.getElementById('total-neta');
+            netaElement.textContent = '$' + totalNeta.toFixed(2);
+            netaElement.className = `text-3xl font-extrabold ${totalNeta >= 0 ? 'text-blue-600' : 'text-red-700'}`;
+
+            // Guardar métricas en el DOM para que el planificador pueda leerlas
+            document.getElementById('neta-por-km-hidden').value = gananciaNetaPorKM; 
+            document.getElementById('total-neta-hidden').value = totalNeta;
+
+
+            // Mostrar métricas clave en una nueva tarjeta
+            document.getElementById('costo-por-km').textContent = costoPorKM > 0 ? `$${costoPorKM.toFixed(3)}` : 'N/A';
+            document.getElementById('neta-por-km').textContent = gananciaNetaPorKM > 0 ? `$${gananciaNetaPorKM.toFixed(3)}` : 'N/A';
+        }
+        
+
+        /**
+         * Recoge los totales y llama a la API de Gemini para un análisis financiero.
+         */
+        window.analyzeData = async () => {
+            const analysisContainer = document.getElementById('analysis-result');
+            const analysisButton = document.getElementById('analysis-button');
+
+            // Leer los totales del DOM
+            const totalKM = parseFloat(document.getElementById('total-km').textContent.replace(' km', '').replace('$', '').replace(',', '')) || 0;
+            const totalIngresos = parseFloat(document.getElementById('total-ingresos').textContent.replace('$', '').replace(',', '')) || 0;
+            const totalGastos = parseFloat(document.getElementById('total-gastos').textContent.replace('$', '').replace(',', '')) || 0;
+            const totalNeta = parseFloat(document.getElementById('total-neta').textContent.replace('$', '').replace(',', '')) || 0;
+            const netaPorKM = document.getElementById('neta-por-km').textContent;
+            const costoPorKM = document.getElementById('costo-por-km').textContent;
+            const periodLabel = document.getElementById('current-period-label').textContent;
+
+
+            if (totalIngresos === 0) {
+                analysisContainer.innerHTML = '<p class="text-yellow-600">No hay datos de ingresos registrados para analizar.</p>';
+                return;
+            }
+            
+            // Mostrar estado de carga y deshabilitar botón
+            analysisContainer.innerHTML = '<div class="flex items-center justify-center text-indigo-600"><svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>Generando análisis...</div>';
+            analysisButton.disabled = true;
+
+            const userQuery = `Analiza los siguientes datos totales de mi negocio de taxi DiDi, correspondientes al periodo: ${periodLabel}. La moneda es pesos ($):
+- Kilómetros recorridos: ${totalKM.toFixed(0)} km
+- Ingresos totales (DiDi): $${totalIngresos.toFixed(2)}
+- Gastos totales (Combustible, Renta Diaria y Otros): $${totalGastos.toFixed(2)}
+- Ganancia Neta Total: $${totalNeta.toFixed(2)}
+- Ganancia Neta por KM: ${netaPorKM}
+- Costo por KM (Solo combustible): ${costoPorKM}
+
+Proporciona un resumen de 2-3 frases, destacando la salud financiera, la eficiencia (ganancia neta por km), y cualquier tendencia positiva o negativa. Menciona el periodo que estás analizando. Mantente en el rol de analista financiero.`;
+
+            const systemPrompt = "Eres un analista financiero experto en negocios de transporte y ride-sharing (como DiDi). Tu objetivo es ofrecer un análisis conciso y profesional de los datos proporcionados (ingresos, gastos, ganancia neta y kilómetros). Identifica la salud financiera, las áreas de mejora y las tendencias notables. Responde siempre en español.";
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+            };
+
+            try {
+                const response = await fetchWithExponentialBackoff(
+                    `${GEMINI_API_URL}?key=${API_KEY}`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    }
+                );
+                
+                const result = await response.json();
+                const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "No se pudo generar el análisis. Intenta de nuevo.";
+                
+                analysisContainer.innerHTML = `<p class="text-gray-700 whitespace-pre-wrap">${text}</p>`;
+
+            } catch (error) {
+                console.error("Error en la API de Gemini:", error);
+                analysisContainer.innerHTML = '<p class="text-red-500">Error: No se pudo conectar con el servicio de análisis.</p>';
+            } finally {
+                analysisButton.disabled = false;
+            }
+        };
+
+        /**
+         * Abre el modal del planificador de metas y precarga datos.
+         */
+        window.openGoalPlanner = () => {
+            document.getElementById('goal-form').reset();
+            document.getElementById('goal-plan-result').innerHTML = '<p class="text-gray-500">Ingresa tu meta financiera y el monto para recibir un plan de acción.</p>';
+            
+            // Leer métricas actuales y mostrarlas en el modal
+            const netaPorKM = document.getElementById('neta-por-km-hidden').value;
+            const totalNeta = document.getElementById('total-neta-hidden').value;
+            const periodLabel = document.getElementById('current-period-label').textContent;
+
+            document.getElementById('goal-current-neta-km').textContent = `$${parseFloat(netaPorKM).toFixed(3)} / km`;
+            document.getElementById('goal-current-neta-total').textContent = `$${parseFloat(totalNeta).toFixed(2)}`;
+            document.getElementById('goal-period-label').textContent = periodLabel;
+
+            document.getElementById('goal-modal').classList.remove('hidden');
+        };
+
+        /**
+         * Genera el plan de metas llamando a la API de Gemini.
+         */
+        window.generateGoalPlan = async () => {
+            const form = document.getElementById('goal-form');
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+
+            const goalDescription = form.goalDescription.value;
+            const targetAmount = parseFloat(form.targetAmount.value);
+            
+            const planResultContainer = document.getElementById('goal-plan-result');
+            const planButton = document.getElementById('goal-plan-button');
+            
+            const netaPorKM = document.getElementById('neta-por-km-hidden').value;
+            const totalNeta = document.getElementById('total-neta-hidden').value;
+            const periodLabel = document.getElementById('current-period-label').textContent;
+
+            if (parseFloat(netaPorKM) <= 0) {
+                planResultContainer.innerHTML = '<p class="text-red-600">Tu Ganancia Neta por KM es cero o negativa. No se puede calcular el plan. ¡Revisa tus gastos!</p>';
+                return;
+            }
+
+            // Mostrar estado de carga y deshabilitar botón
+            planResultContainer.innerHTML = '<div class="flex items-center justify-center text-purple-600"><svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-purple-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>Calculando plan de metas...</div>';
+            planButton.disabled = true;
+
+            const userQuery = `Mi meta financiera es: "${goalDescription}" y necesito ahorrar $${targetAmount.toFixed(2)} pesos.
+
+Mi rendimiento actual (Ganancia Neta por KM) es de $${parseFloat(netaPorKM).toFixed(3)} pesos por kilómetro recorrido.
+Mi Ganancia Neta Total en el periodo actual (${periodLabel}) fue de $${parseFloat(totalNeta).toFixed(2)} pesos.
+
+Por favor, actúa como un planificador financiero y proporciona un plan de acción conciso, incluyendo:
+1. La cantidad total de kilómetros que necesito recorrer para alcanzar la meta (basado en la Ganancia Neta por KM).
+2. Una estimación de tiempo (días, semanas o meses), asumiendo un promedio diario de 150 km recorridos.
+3. Un consejo de ahorro o eficiencia relacionado con mi meta y mi rendimiento actual.`;
+
+            const systemPrompt = "Eres un planificador financiero experto en la industria del ride-sharing. Tu tarea es generar un plan de acción motivador y numérico para la meta de ahorro de un conductor. Enfoca el plan en la acción (kilómetros a recorrer) y el tiempo estimado. Responde siempre en español y con formato fácil de leer.";
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+            };
+
+            try {
+                const response = await fetchWithExponentialBackoff(
+                    `${GEMINI_API_URL}?key=${API_KEY}`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    }
+                );
+                
+                const result = await response.json();
+                const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "No se pudo generar el plan. Intenta de nuevo.";
+                
+                planResultContainer.innerHTML = `<p class="text-gray-700 whitespace-pre-wrap">${text}</p>`;
+
+            } catch (error) {
+                console.error("Error en la API de Gemini:", error);
+                planResultContainer.innerHTML = '<p class="text-red-500">Error: No se pudo conectar con el planificador de metas.</p>';
+            } finally {
+                planButton.disabled = false;
+            }
+        };
+
+        /**
+         * Abre el modal de confirmación para eliminar un registro.
+         * @param {string} id - ID del documento a eliminar.
+         */
+        window.confirmDelete = (id) => {
+            document.getElementById('modal-delete-id').value = id;
+            document.getElementById('delete-modal').classList.remove('hidden');
+        };
+
+        /**
+         * Confirma y elimina el registro de Firestore.
+         */
+        window.deleteRegistro = async () => {
+            const id = document.getElementById('modal-delete-id').value;
+            if (!id || !dataCollectionRef) return;
+
+            try {
+                await deleteDoc(doc(dataCollectionRef, id));
+                document.getElementById('delete-modal').classList.add('hidden');
+                showMessage('Registro eliminado con éxito.', 'bg-green-500');
+            } catch (error) {
+                console.error("Error al eliminar el registro:", error);
+                showMessage('Error al eliminar el registro.', 'bg-red-500');
+            }
+        };
+
+        /**
+         * Cierra cualquier modal abierto.
+         */
+        window.closeModal = (id) => {
+            document.getElementById(id).classList.add('hidden');
+            // Limpiar el formulario y el ID de edición al cerrar el modal de registro
+            if (id === 'registro-modal') {
+                document.getElementById('registro-form').reset();
+                document.getElementById('registro-id').value = ''; // Limpiar ID de edición
+                document.getElementById('modal-title').textContent = 'Agregar Nuevo Registro';
+            }
+        };
+
+        /**
+         * Alterna la visibilidad entre dos secciones de la interfaz.
+         * @param {string} sectionToShowId - ID de la sección a mostrar.
+         * @param {string} sectionToHideId - ID de la sección a ocultar.
+         */
+        window.toggleSection = (sectionToShowId, sectionToHideId) => {
+            document.getElementById(sectionToHideId).classList.add('config-hidden');
+            document.getElementById(sectionToShowId).classList.remove('config-hidden');
+            // Restablecer el mensaje de análisis al cambiar de sección
+            document.getElementById('analysis-result').innerHTML = '<p class="text-gray-500">Haz clic en "Generar Análisis Financiero" para obtener una evaluación experta de tus totales.</p>';
+        }
+
+        /**
+         * Realiza el cálculo del gasto de combustible y actualiza el campo.
+         */
+        window.calculateGasExpense = () => {
+            const kmInput = document.getElementById('kmRecorridos');
+            const gasInput = document.getElementById('gastoCombustible');
+            
+            const kmRecorridos = parseFloat(kmInput.value) || 0;
+            const costoLitro = window.currentConfig.costoGasolina;
+            const rendimiento = window.currentConfig.rendimientoGasolina;
+
+            if (kmRecorridos > 0 && costoLitro > 0 && rendimiento > 0) {
+                // Cálculo: KM * (Costo Litro / Rendimiento KM/L)
+                const costoPorKM = costoLitro / rendimiento;
+                const gastoCalculado = kmRecorridos * costoPorKM;
+                
+                // Mostrar el valor redondeado a dos decimales y permitir al usuario ajustarlo si es necesario
+                gasInput.value = gastoCalculado.toFixed(2);
+            } else {
+                // Si faltan datos de configuración o KM es 0, el campo es 0
+                gasInput.value = 0;
+            }
+        }
+
+
+        /**
+         * Abre el modal para editar o agregar un registro.
+         * @param {string | null} id - ID del documento a editar, o nulo para agregar.
+         */
+        window.editRegistro = (id) => {
+            document.getElementById('registro-form').reset();
+            document.getElementById('registro-id').value = id || '';
+            const modalTitle = document.getElementById('modal-title');
+            
+            // Asignar el evento de cálculo dinámico
+            document.getElementById('kmRecorridos').oninput = window.calculateGasExpense;
+
+            if (id) {
+                modalTitle.textContent = 'Editar Registro Existente';
+                // Buscar el registro en la lista actual y llenar el formulario
+                // NOTA: Para edición, se buscan los datos en la tabla renderizada (no en allRegistros)
+                const rows = document.getElementById('registros-container').querySelectorAll('tbody tr');
+                rows.forEach(row => {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length > 0) {
+                        const deleteBtn = row.querySelector('.delete-btn');
+                        const onclickAttr = deleteBtn.getAttribute('onclick');
+                        const dataIdMatch = onclickAttr ? onclickAttr.match(/'([^']+)'/) : null;
+                        const dataId = dataIdMatch ? dataIdMatch[1] : null;
+
+                        if (dataId === id) {
+                            // Cargar todos los campos desde el registro existente
+                            document.getElementById('fecha').value = cells[0].textContent;
+                            document.getElementById('kmRecorridos').value = parseFloat(cells[1].textContent.replace(' km', ''));
+                            document.getElementById('ingresoDiDi').value = parseFloat(cells[2].textContent.replace('$', ''));
+                            document.getElementById('gastoCombustible').value = parseFloat(cells[3].textContent.replace('$', ''));
+                            // cells[4] es Renta Diaria
+                            document.getElementById('otrosGastos').value = parseFloat(cells[5].textContent.replace('$', ''));
+                            document.getElementById('descripcionGastos').value = cells[5].getAttribute('title') || '';
+                        }
+                    }
+                });
+            } else {
+                modalTitle.textContent = 'Agregar Nuevo Registro';
+                // Establecer la fecha actual por defecto
+                document.getElementById('fecha').valueAsDate = new Date();
+            }
+
+            // Forzar un cálculo inicial si se abrió el modal con datos (edición) o si se está agregando un registro
+            window.calculateGasExpense();
+
+            document.getElementById('registro-modal').classList.remove('hidden');
+        };
+
+        /**
+         * Guarda o actualiza un registro en Firestore.
+         */
+        window.saveRegistro = async () => {
+            const form = document.getElementById('registro-form');
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+            
+            const id = document.getElementById('registro-id').value;
+            const data = {
+                fecha: form.fecha.value,
+                kmRecorridos: parseFloat(form.kmRecorridos.value),
+                ingresoDiDi: parseFloat(form.ingresoDiDi.value),
+                gastoCombustible: parseFloat(form.gastoCombustible.value),
+                otrosGastos: parseFloat(form.otrosGastos.value),
+                descripcionGastos: form.descripcionGastos.value,
+            };
+
+            if (!dataCollectionRef) {
+                showMessage('Base de datos no inicializada. Intenta de nuevo.', 'bg-red-500');
+                return;
+            }
+
+            try {
+                if (id) {
+                    // Actualizar
+                    await updateDoc(doc(dataCollectionRef, id), data);
+                    showMessage('Registro actualizado con éxito.', 'bg-blue-500');
+                } else {
+                    // Agregar
+                    await addDoc(dataCollectionRef, data);
+                    showMessage('Nuevo registro agregado con éxito.', 'bg-green-500');
+                }
+                closeModal('registro-modal');
+            } catch (error) {
+                console.error("Error al guardar el registro:", error);
+                showMessage('Error al guardar el registro.', 'bg-red-500');
+            }
+        };
+
+        /**
+         * Muestra un mensaje temporal al usuario.
+         * @param {string} message - Mensaje a mostrar.
+         * @param {string} bgColor - Clase de color de fondo de Tailwind.
+         */
+        function showMessage(message, bgColor) {
+            const msgElement = document.getElementById('toast-message');
+            msgElement.textContent = message;
+            msgElement.className = `fixed bottom-5 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded shadow-lg text-white ${bgColor} transition-opacity duration-300 z-50`;
+            msgElement.style.opacity = 1;
+
+            setTimeout(() => {
+                msgElement.style.opacity = 0;
+            }, 3000);
+        }
+
+
+        // Inicializar Firebase al cargar la ventana
+        window.onload = initializeFirebase;
+    </script>
+</head>
+<body class="p-4 md:p-8">
+
+    <!-- Mensaje Toast para feedback -->
+    <div id="toast-message" class="opacity-0"></div>
+
+    <div class="max-w-4xl mx-auto bg-white shadow-xl rounded-xl p-4 md:p-8">
+        
+        <!-- Botón de Configuración -->
+        <div class="flex justify-end mb-4">
+            <button onclick="toggleSection('config-section', 'main-dashboard')" class="text-indigo-600 hover:text-indigo-800 text-sm font-semibold p-2 rounded-lg transition duration-150 flex items-center">
+                <!-- Icono de Engranaje (Configuración) -->
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37a1.724 1.724 0 002.572-1.065z" />
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                Configuración
+            </button>
+        </div>
+
+        <!-- SECCIÓN DE CONFIGURACIÓN (oculta por defecto) -->
+        <div id="config-section" class="config-hidden">
+            <h1 class="text-4xl font-bold text-gray-800 mb-2">Ajustes de Negocio ⚙️</h1>
+            <p class="text-gray-500 mb-6">Ingresa los datos fijos de tu vehículo y operación.</p>
+
+            <form id="config-form" onsubmit="event.preventDefault(); saveConfig()" class="space-y-4 p-6 bg-white border border-gray-200 rounded-xl shadow-lg">
+                <h3 class="text-xl font-semibold text-gray-700 border-b pb-2">Información del Conductor y Vehículo</h3>
+                
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <!-- Nombre del Chofer -->
+                    <div>
+                        <label for="nombreChofer" class="block text-sm font-medium text-gray-700">Nombre del Chofer</label>
+                        <input type="text" id="nombreChofer" name="nombreChofer" required placeholder="Ej: Juan Pérez" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+                    <!-- Placas del Automóvil -->
+                    <div>
+                        <label for="placas" class="block text-sm font-medium text-gray-700">Placas del Automóvil</label>
+                        <input type="text" id="placas" name="placas" required placeholder="Ej: ABC-1234" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+                </div>
+
+                <!-- Plataforma -->
+                <div>
+                    <label for="plataforma" class="block text-sm font-medium text-gray-700">Plataforma de Viajes</label>
+                    <input type="text" id="plataforma" name="plataforma" required value="DiDi" placeholder="Ej: DiDi, Uber" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                </div>
+
+                <h3 class="text-xl font-semibold text-gray-700 border-b pb-2 pt-4">Costos Fijos y de Combustible</h3>
+
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <!-- Costo del litro de Gasolina -->
+                    <div>
+                        <label for="costoGasolina" class="block text-sm font-medium text-gray-700">Costo promedio Litro Gasolina ($)</label>
+                        <input type="number" id="costoGasolina" name="costoGasolina" step="any" min="0" required placeholder="Ej: 22.50" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+                    <!-- Rendimiento de Gasolina del auto -->
+                    <div>
+                        <label for="rendimientoGasolina" class="block text-sm font-medium text-gray-700">Rendimiento del Auto (km/litro)</label>
+                        <input type="number" id="rendimientoGasolina" name="rendimientoGasolina" step="any" min="0.1" required placeholder="Ej: 12.00" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+                    <!-- Costo de Renta del Vehículo (Semanal) -->
+                    <div>
+                        <label for="rentaSemanal" class="block text-sm font-medium text-gray-700">Renta del Vehículo (Semanal $)</label>
+                        <input type="number" id="rentaSemanal" name="rentaSemanal" step="any" min="0" required value="0" placeholder="Ej: 1500.00" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+                </div>
+
+                <div class="pt-6 flex flex-col md:flex-row gap-3">
+                    <button type="submit" class="w-full md:w-1/2 px-4 py-3 bg-green-600 text-white font-semibold rounded-xl shadow-md hover:bg-green-700 transition duration-150 ease-in-out">
+                        💾 Guardar Configuración
+                    </button>
+                    <button type="button" onclick="toggleSection('main-dashboard', 'config-section')" class="w-full md:w-1/2 px-4 py-3 bg-gray-200 text-gray-700 font-semibold rounded-xl shadow-md hover:bg-gray-300 transition duration-150 ease-in-out">
+                        Cancelar y Volver
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <!-- SECCIÓN PRINCIPAL (Dashboard) -->
+        <div id="main-dashboard">
+            <h1 class="text-4xl font-bold text-gray-800 mb-2">Control de Taxi 🚕</h1>
+            <p id="info-chofer" class="text-sm font-medium text-indigo-600 mb-2">N/A | N/A</p>
+            <p class="text-gray-500 mb-6">Ganancia Neta = Ingresos - Combustible - Otros Gastos - Renta Diaria</p>
+            <p id="user-id-display" class="text-xs text-gray-400 mb-4 truncate">Cargando conexión...</p>
+
+            <!-- CONTROLES DE PERIODO -->
+            <div class="mb-6 p-4 bg-white border border-gray-200 rounded-xl shadow-md">
+                <h3 class="text-lg font-semibold text-gray-700 mb-3">Filtro de Período Actual</h3>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <!-- Selector de Periodo -->
+                    <div>
+                        <label for="periodo-select" class="block text-sm font-medium text-gray-700">Seleccionar Periodo:</label>
+                        <select id="periodo-select" onchange="filterAndRenderData()" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                            <option value="all">Todos los registros</option>
+                            <option value="day">Día</option>
+                            <option value="week" selected>Semana</option>
+                            <option value="month">Mes</option>
+                        </select>
+                    </div>
+                    <!-- Fecha Base para el Periodo -->
+                    <div class="md:col-span-2">
+                        <label for="periodo-date" class="block text-sm font-medium text-gray-700">Fecha Base del Periodo:</label>
+                        <input type="date" id="periodo-date" onchange="filterAndRenderData()" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+                </div>
+                <!-- Etiqueta del Periodo Actual -->
+                <p class="mt-4 text-sm font-medium text-indigo-600">Mostrando datos para el período: <span id="current-period-label">Cargando...</span></p>
+            </div>
+
+
+            <!-- Sección de Totales (Tarjetas) -->
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
+                <!-- Tarjeta de Ingresos Totales -->
+                <div class="bg-green-100 p-4 rounded-lg shadow-md">
+                    <p class="text-sm font-medium text-green-700">Ingresos Totales</p>
+                    <p id="total-ingresos" class="text-xl md:text-2xl font-bold text-green-600">$0.00</p>
+                </div>
+                <!-- Tarjeta de Gastos Totales -->
+                <div class="bg-red-100 p-4 rounded-lg shadow-md">
+                    <p class="text-sm font-medium text-red-700">Gastos Totales</p>
+                    <p id="total-gastos" class="text-xl md:text-2xl font-bold text-red-600">$0.00</p>
+                </div>
+                <!-- Tarjeta de Ganancia Neta -->
+                <div class="col-span-2 md:col-span-1 bg-blue-100 p-4 rounded-lg shadow-md flex flex-col justify-center">
+                    <p class="text-sm font-medium text-blue-700">Ganancia Neta Total</p>
+                    <p id="total-neta" class="text-3xl font-extrabold text-blue-600">$0.00</p>
+                </div>
+                <!-- Tarjeta de KM Recorridos -->
+                <div class="bg-yellow-100 p-4 rounded-lg shadow-md">
+                    <p class="text-sm font-medium text-yellow-700">KM Totales</p>
+                    <p id="total-km" class="text-xl md:text-2xl font-bold text-yellow-600">0 km</p>
+                </div>
+                <!-- Nueva Tarjeta: Gasto Renta Diaria -->
+                <div class="bg-indigo-100 p-4 rounded-lg shadow-md">
+                    <p class="text-sm font-medium text-indigo-700">Renta Diaria Est.</p>
+                    <p id="gasto-renta-diaria" class="text-xl md:text-2xl font-bold text-indigo-600">$0.00</p>
+                </div>
+                <!-- Nueva Tarjeta: Neta por KM -->
+                <div class="bg-purple-100 p-4 rounded-lg shadow-md">
+                    <p class="text-sm font-medium text-purple-700">Neta por KM</p>
+                    <p id="neta-por-km" class="text-xl md:text-2xl font-bold text-purple-600">N/A</p>
+                </div>
+                <!-- Nueva Tarjeta: Costo por KM -->
+                <div class="bg-gray-200 p-4 rounded-lg shadow-md">
+                    <p class="text-sm font-medium text-gray-700">Costo Combustible / KM</p>
+                    <p id="costo-por-km" class="text-xl md:text-2xl font-bold text-gray-600">N/A</p>
+                </div>
+            </div>
+
+            <!-- Botones de Acción y Análisis -->
+            <div class="mb-6 grid grid-cols-1 md:grid-cols-3 gap-4">
+                <!-- Registro -->
+                <button onclick="editRegistro(null)" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-xl transition duration-300 shadow-lg hover:shadow-xl focus:outline-none focus:ring-4 focus:ring-indigo-500 focus:ring-opacity-50">
+                    + Agregar Nuevo Registro
+                </button>
+                <!-- Análisis Financiero (Gemini) -->
+                <button id="analysis-button" onclick="analyzeData()" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-xl transition duration-300 shadow-lg hover:shadow-xl focus:outline-none focus:ring-4 focus:ring-blue-500 focus:ring-opacity-50">
+                    ✨ Generar Análisis Financiero
+                </button>
+                <!-- Planificador de Metas (Nuevo Gemini Feature) -->
+                <button onclick="openGoalPlanner()" class="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 px-6 rounded-xl transition duration-300 shadow-lg hover:shadow-xl focus:outline-none focus:ring-4 focus:ring-purple-500 focus:ring-opacity-50">
+                    ✨ Planificador de Metas
+                </button>
+            </div>
+
+            <!-- Área de Análisis Generado por Gemini -->
+            <div class="mb-8 p-4 bg-gray-50 border border-blue-200 rounded-lg shadow-inner">
+                <h3 class="text-xl font-semibold text-blue-800 mb-3">✨ Análisis Rápido (Gemini AI)</h3>
+                <div id="analysis-result">
+                    <p class="text-gray-500">Haz clic en "Generar Análisis Financiero" para obtener una evaluación experta de tus totales.</p>
+                </div>
+            </div>
+
+            <!-- Tabla de Registros -->
+            <h2 class="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Historial de Registros</h2>
+            <div id="registros-container" class="bg-white rounded-xl shadow-lg border">
+                <!-- Los registros se inyectarán aquí por JavaScript -->
+                <p class="text-gray-500 text-center py-4">Cargando datos...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Campos ocultos para pasar métricas al planificador de metas (Movidos para evitar errores de null) -->
+    <input type="hidden" id="neta-por-km-hidden" value="0">
+    <input type="hidden" id="total-neta-hidden" value="0">
+
+    <!-- Modal de AGREGAR/EDITAR Registro -->
+    <div id="registro-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full z-40" onclick="closeModal('registro-modal')">
+        <div class="relative top-20 mx-auto p-5 border w-11/12 md:max-w-lg shadow-lg rounded-xl bg-white" onclick="event.stopPropagation()">
+            <div class="mt-3 text-center">
+                <h3 id="modal-title" class="text-lg leading-6 font-medium text-gray-900 mb-4">Agregar Nuevo Registro</h3>
+                <form id="registro-form" onsubmit="event.preventDefault(); saveRegistro()">
+                    <input type="hidden" id="registro-id" value="">
+
+                    <!-- Fecha -->
+                    <div class="mb-4 text-left">
+                        <label for="fecha" class="block text-sm font-medium text-gray-700">Fecha del Viaje</label>
+                        <input type="date" id="fecha" name="fecha" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+
+                    <!-- KM Recorridos -->
+                    <div class="mb-4 text-left">
+                        <label for="kmRecorridos" class="block text-sm font-medium text-gray-700">Kilómetros Recorridos (km)</label>
+                        <!-- Se agrega el evento oninput para forzar el cálculo al cambiar los KM -->
+                        <input type="number" id="kmRecorridos" name="kmRecorridos" step="any" min="0" required placeholder="Ej: 150.5" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border" oninput="calculateGasExpense()">
+                    </div>
+
+                    <!-- Ingreso DiDi -->
+                    <div class="mb-4 text-left">
+                        <label for="ingresoDiDi" class="block text-sm font-medium text-gray-700">Ingreso Total de DiDi ($)</label>
+                        <input type="number" id="ingresoDiDi" name="ingresoDiDi" step="any" min="0" required placeholder="Ej: 850.00" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+
+                    <!-- Gasto Combustible -->
+                    <div class="mb-4 text-left">
+                        <label for="gastoCombustible" class="block text-sm font-medium text-gray-700">Gasto en Combustible ($) <span class="text-xs text-gray-500">(Calculado auto, se puede ajustar)</span></label>
+                        <!-- El valor se actualiza mediante JavaScript -->
+                        <input type="number" id="gastoCombustible" name="gastoCombustible" step="any" min="0" required value="0" placeholder="Ej: 300.00 (Monto pagado en gasolinera)" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+
+                    <!-- Otros Gastos -->
+                    <div class="mb-4 text-left">
+                        <label for="otrosGastos" class="block text-sm font-medium text-gray-700">Otros Gastos ($)</label>
+                        <input type="number" id="otrosGastos" name="otrosGastos" step="any" min="0" required value="0" placeholder="Ej: 20.00 (Lavado, mantenimiento)" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+                    
+                    <!-- Descripción de Otros Gastos -->
+                    <div class="mb-6 text-left">
+                        <label for="descripcionGastos" class="block text-sm font-medium text-gray-700">Descripción de Otros Gastos (Opcional)</label>
+                        <input type="text" id="descripcionGastos" name="descripcionGastos" placeholder="Ej: Lavado de carro" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                    </div>
+
+                    <div class="items-center px-4 py-3">
+                        <button type="submit" class="w-full px-4 py-2 bg-indigo-600 text-white text-base font-medium rounded-xl shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 ease-in-out">
+                            Guardar Registro
+                        </button>
+                        <button type="button" onclick="closeModal('registro-modal')" class="mt-3 w-full px-4 py-2 bg-gray-200 text-gray-700 text-base font-medium rounded-xl shadow-sm hover:bg-gray-300 focus:outline-none transition duration-150 ease-in-out">
+                            Cancelar
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de PLANIFICADOR DE METAS (Nuevo Feature) -->
+    <div id="goal-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full z-40" onclick="closeModal('goal-modal')">
+        <div class="relative top-10 mx-auto p-5 border w-11/12 md:max-w-lg shadow-lg rounded-xl bg-white" onclick="event.stopPropagation()">
+            <div class="mt-3 text-center">
+                <h3 class="text-xl leading-6 font-bold text-purple-700 mb-4">✨ Planificador de Metas y Ahorro</h3>
+                <p class="text-sm text-gray-500 mb-4">La IA de Gemini te ayudará a calcular cuánto debes trabajar para alcanzar tu objetivo.</p>
+                
+                <!-- Métricas Actuales -->
+                <div class="p-3 bg-purple-50 rounded-lg mb-4 text-left text-sm">
+                    <p class="font-semibold text-purple-800">Métricas Actuales (Período: <span id="goal-period-label" class="font-normal text-purple-700">Cargando...</span>)</p>
+                    <p>Ganancia Neta Total: <span id="goal-current-neta-total" class="font-bold text-purple-600">$0.00</span></p>
+                    <p>Neta por Kilómetro: <span id="goal-current-neta-km" class="font-bold text-purple-600">N/A</span></p>
+                </div>
+
+                <form id="goal-form" onsubmit="event.preventDefault(); generateGoalPlan()">
+                    <!-- Descripción de la Meta -->
+                    <div class="mb-4 text-left">
+                        <label for="goalDescription" class="block text-sm font-medium text-gray-700">Describe tu Meta Financiera</label>
+                        <input type="text" id="goalDescription" name="goalDescription" required placeholder="Ej: Ahorrar para el mantenimiento anual del auto" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-purple-500 focus:ring-purple-500 p-2 border">
+                    </div>
+
+                    <!-- Monto Requerido -->
+                    <div class="mb-6 text-left">
+                        <label for="targetAmount" class="block text-sm font-medium text-gray-700">Monto de Ahorro Requerido ($)</label>
+                        <input type="number" id="targetAmount" name="targetAmount" step="any" min="1" required placeholder="Ej: 5000.00" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-purple-500 focus:ring-purple-500 p-2 border">
+                    </div>
+
+                    <button type="submit" id="goal-plan-button" class="w-full px-4 py-2 bg-purple-600 text-white text-base font-medium rounded-xl shadow-sm hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500 transition duration-150 ease-in-out">
+                        Generar Plan
+                    </button>
+                    
+                </form>
+
+                <!-- Área de Resultados del Plan -->
+                <div class="mt-6 p-4 bg-gray-50 border border-purple-200 rounded-lg text-left">
+                    <h4 class="font-bold text-purple-800 mb-2">Plan de Acción:</h4>
+                    <div id="goal-plan-result" class="text-sm text-gray-700">
+                        <p class="text-gray-500">Ingresa tu meta financiera y el monto para recibir un plan de acción.</p>
+                    </div>
+                </div>
+
+                <button type="button" onclick="closeModal('goal-modal')" class="mt-4 w-full px-4 py-2 bg-gray-200 text-gray-700 text-base font-medium rounded-xl shadow-sm hover:bg-gray-300 focus:outline-none transition duration-150 ease-in-out">
+                    Cerrar
+                </button>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- Modal de CONFIRMACIÓN de Eliminación (No modificado) -->
+    <div id="delete-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full z-40" onclick="closeModal('delete-modal')">
+        <div class="relative top-20 mx-auto p-5 border w-11/12 md:max-w-sm shadow-lg rounded-xl bg-white" onclick="event.stopPropagation()">
+            <div class="mt-3 text-center">
+                <h3 class="text-lg leading-6 font-medium text-gray-900">Confirmar Eliminación</h3>
+                <div class="mt-2 px-7 py-3">
+                    <p class="text-sm text-gray-500">
+                        ¿Estás seguro de que deseas eliminar este registro? Esta acción no se puede deshacer.
+                    </p>
+                    <input type="hidden" id="modal-delete-id">
+                </div>
+                <div class="items-center px-4 py-3 sm:flex">
+                    <button id="ok-btn" onclick="deleteRegistro()" class="w-full sm:w-1/2 px-4 py-2 bg-red-600 text-white text-base font-medium rounded-xl shadow-sm hover:bg-red-700 focus:outline-none transition duration-150 ease-in-out sm:mr-3">
+                        Sí, Eliminar
+                    </button>
+                    <button id="cancel-btn" onclick="closeModal('delete-modal')" class="mt-3 sm:mt-0 w-full sm:w-1/2 px-4 py-2 bg-gray-200 text-gray-700 text-base font-medium rounded-xl shadow-sm hover:bg-gray-300 focus:outline-none transition duration-150 ease-in-out">
+                        Cancelar
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
