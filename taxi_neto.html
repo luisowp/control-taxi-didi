@@ -559,8 +559,9 @@
          * Genera un reporte PDF de los datos filtrados actualmente.
          */
         window.generatePDFReport = () => {
-            if (typeof window.jsPDF === 'undefined') {
-                showMessage('Error: jsPDF no está cargado.', 'bg-red-500');
+            // VERIFICACIÓN DE CLASE CORREGIDA
+            if (typeof window.jspdf === 'undefined' || typeof window.jspdf.jsPDF === 'undefined') {
+                showMessage('Error: jsPDF no cargado. Asegúrate de tener conexión a Internet.', 'bg-red-500');
                 return;
             }
 
@@ -793,13 +794,13 @@ Por favor, actúa como un planificador financiero y proporciona un plan de acci�
                 );
                 
                 const result = await response.json();
-                const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "No se pudo generar el plan. Intenta de nuevo.";
+                const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "No se pudo generar el análisis. Intenta de nuevo.";
                 
-                planResultContainer.innerHTML = `<p class="text-gray-700 whitespace-pre-wrap">${text}</p>`;
+                analysisContainer.innerHTML = `<p class="text-gray-700 whitespace-pre-wrap">${text}</p>`;
 
             } catch (error) {
                 console.error("Error en la API de Gemini:", error);
-                planResultContainer.innerHTML = '<p class="text-red-500">Error: No se pudo conectar con el planificador de metas.</p>';
+                analysisContainer.innerHTML = '<p class="text-red-500">Error: No se pudo conectar con el planificador de metas.</p>';
             } finally {
                 planButton.disabled = false;
             }
@@ -1353,7 +1354,5 @@ Por favor, actúa como un planificador financiero y proporciona un plan de acci�
             </div>
         </div>
     </div>
-
-
 </body>
 </html>
