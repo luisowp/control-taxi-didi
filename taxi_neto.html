@@ -622,7 +622,8 @@
                 'Ingreso DiDi', 
                 'Combustible', 
                 'Renta Diaria', 
-                'Otros Gastos', 
+                'Otros Gastos',
+                'Descripción', // <--- NUEVO ENCABEZADO
                 'G. Neta'
             ];
             
@@ -633,6 +634,7 @@
                 `$${reg.gastoCombustible.toFixed(2)}`,
                 `$${reg.gastoRentaDiaria.toFixed(2)}`,
                 `$${reg.otrosGastos.toFixed(2)}`,
+                reg.descripcionGastos, // <--- NUEVA COLUMNA DE DATOS
                 `$${reg.gananciaNeta.toFixed(2)}`,
             ]);
 
